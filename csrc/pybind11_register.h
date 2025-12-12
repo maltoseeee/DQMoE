@@ -103,7 +103,7 @@ template <typename T,           /*The type used for activations*/
     typename Enable = void>
 static void m_grouped_moe_nt_contiguous(std::pair<torch::Tensor, torch::Tensor> const& a,
     std::pair<torch::Tensor, torch::Tensor> const& b, std::pair<torch::Tensor, torch::Tensor> const& b1,
-    torch::Tensor d, torch::Tensor const& m_indices, torch::Tensor workspace, int quant_mode_value)
+    torch::Tensor d, torch::Tensor const& m_indices, torch::Tensor workspace, int quant_mode_value, bool fused)
 {
     auto const& [num_tokens, hidden_size] = get_shape<2>(a.first);
     auto const& [num_groups, inter_size_2, hidden_size_] = get_shape<3>(b.first);
@@ -147,7 +147,7 @@ static void m_grouped_moe_nt_contiguous(std::pair<torch::Tensor, torch::Tensor> 
         static_cast<int*>(m_indices.data_ptr()), nullptr, nullptr, d.data_ptr(), quant_mode,
         QuantParams::FP8(static_cast<float*>(sfa.data_ptr()), static_cast<float*>(sfb.data_ptr()),
             static_cast<float*>(sfb1.data_ptr())),
-        num_groups, topk, num_tokens, hidden_size, inter_size, static_cast<char*>(workspace.data_ptr()), stream, {});
+        num_groups, topk, num_tokens, hidden_size, inter_size, static_cast<char*>(workspace.data_ptr()), stream, {}, fused);
 }
 
 static void register_apis(pybind11::module_& m)
@@ -155,8 +155,9 @@ static void register_apis(pybind11::module_& m)
     m.def("get_mn_major_tma_aligned_tensor", &get_mn_major_tma_aligned_tensor);
     m.def("m_grouped_moe_nt_contiguous_fp8_bf16",
         &m_grouped_moe_nt_contiguous<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>, py::arg("a"), py::arg("b"),
-        py::arg("b1"), py::arg("d"), py::arg("m_indices"), py::arg("workspace"), py::arg("quant_mode_value"));
+        py::arg("b1"), py::arg("d"), py::arg("m_indices"), py::arg("workspace"), py::arg("quant_mode_value"),
+        py::arg("fused") = true);
     m.def("m_grouped_moe_nt_contiguous_bf16", &m_grouped_moe_nt_contiguous<__nv_bfloat16, __nv_bfloat16>, py::arg("a"),
         py::arg("b"), py::arg("b1"), py::arg("d"), py::arg("m_indices"), py::arg("workspace"),
-        py::arg("quant_mode_value"));
+        py::arg("quant_mode_value"), py::arg("fused") = true);
 }
