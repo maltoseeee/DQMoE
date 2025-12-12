@@ -7,7 +7,7 @@
 - [x] 支持 BF16, FP16, FP32 实现
 - [x] 支持 Tensor-wise, Channel-wise 量化
 - [x] 支持 1 X 128 X 128 Block-wise 量化
-- [ ] 提供性能更好 `ada` FP8 GEMM fused kernel
+- [x] 提供性能更好 `ada` FP8 GEMM fused kernel
 - [ ] 运用高性能的 `DeepGEMM` 实现
 
 ## 主要特性
