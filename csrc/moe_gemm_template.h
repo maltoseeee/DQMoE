@@ -747,6 +747,9 @@ __global__ void configureGemmKernelWithVisitor(int num_experts, int const* cumsu
     ElementB** ptr_B, LeadingDimElement* lda, LeadingDimElement* ldb, ProblemShape* problem_sizes_device,
     EpilogueParams* epilogue_params_device)
 {
+    static_assert(sizeof(SimplifiedEpilogueParams<ScaleType, ElementD>) == sizeof(EpilogueParams),
+            "SimplifiedEpilogueParams size must match EpilogueParams size");
+
     int expert_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (expert_id < num_experts)
     {
