@@ -39,6 +39,7 @@ def print_error_metric(a, b, type: str):
     print(f"RelErr (%)  : {rel_err:.4f}%")
     print("d", a)
     print("ref_d_", b)
+    print()
 
 
 def test_dynamic_quantization_moe(
@@ -168,7 +169,6 @@ def compare_grouped_gemm_fused_and_unfused():
         torch.cuda.synchronize()
 
         print_error_metric(d_, ref_d_, "channel")
-        print()
 
 
 def test(compute_capability: int):

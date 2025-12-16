@@ -672,10 +672,80 @@ struct moeGemmRowWise
     }
 };
 
-template <typename ElementA, typename ElementB, typename LeadingDimElement, typename ProblemShape>
+// A simple POD structure, can be constructed on host or device
+// Corresponds to EVTD = Sm80EVT<D, Sm80EVT<Compute1, Sm80EVT<Compute0, Accum, ScaleA>, ScaleB>>
+template<typename ScaleType, typename ElementD>
+struct SimplifiedEpilogueParams {
+    // The memory layout must be exactly the same as EpilogueParams.
+    //
+    // Memory layout derivation (based on the recursive structure of Sm80EVT):
+    //   EVTCompute0 = Sm80EVT<Compute0, Accum, ScaleA>
+    //     -> Params = tuple<Accum::Params(empty), ScaleA::Params(16B), Compute0::Params(empty)>
+    //     -> Total size: 32 bytes
+    //
+    //   EVTCompute1 = Sm80EVT<Compute1, EVTCompute0, ScaleB>
+    //     -> Params = tuple<EVTCompute0::Params(32B), ScaleB::Params(16B), Compute1::Params(empty)>
+    //     -> Total size: 56 bytes
+    //
+    //   EVTD = Sm80EVT<D, EVTCompute1>
+    //     -> Params = tuple<EVTCompute1::Params(56B), D::Params(16B)>
+    //     -> Total size: 72 bytes
+    //
+    // Actual memory layout (72 bytes total):
+    //
+    //   [EVTCompute1::Params - 56 bytes]
+    //     [EVTCompute0::Params - 32 bytes]
+    //       offset 0-7:   Accum::Params(empty,1B) + padding(7B) = 8 bytes
+    //       offset 8-23:  ScaleA::Params (ptr_col 8B, null_default 4B, padding 4B) = 16 bytes
+    //       offset 24-31: Compute0::Params(empty,1B) + padding(7B) = 8 bytes
+    //     [ScaleB::Params - 16 bytes]
+    //       offset 32-47: ScaleB::Params (ptr_row 8B, null_default 4B, padding 4B) = 16 bytes
+    //     [Compute1::Params - 8 bytes]
+    //       offset 48-55: Compute1::Params(empty,1B) + padding(7B) = 8 bytes
+    //   [D::Params - 16 bytes]
+    //     offset 56-71: D::Params (ptr_aux 8B, stride_m 8B) = 16 bytes
+    //
+
+    uint64_t accum_padding;              // offset 0:  Accum::Params(empty,1B) + padding(7B)
+    ScaleType const* ptr_scale_a;        // offset 8:  ScaleA::Params::ptr_col
+    ScaleType null_default_a;            // offset 16: ScaleA::Params::null_default (4B)
+    uint32_t padding1;                   // offset 20: Padding after ScaleA stride (4B)
+    uint64_t compute0_padding;           // offset 24: Compute0::Params(empty,1B) + padding(7B)
+    ScaleType const* ptr_scale_b;        // offset 32: ScaleB::Params::ptr_row
+    ScaleType null_default_b;            // offset 40: ScaleB::Params::null_default (4B)
+    uint32_t padding2;                   // offset 44: Padding after ScaleB stride (4B)
+    uint64_t compute1_padding;           // offset 48: Compute1::Params(empty,1B) + padding(7B)
+    ElementD* ptr_d;                     // offset 56: D::Params::ptr_aux
+    int64_t stride_d_m;                  // offset 64: D::Params::dAux (leading dimension)
+
+    // Constructor
+    CUTLASS_HOST_DEVICE
+    SimplifiedEpilogueParams(
+        ScaleType const* scale_a_ptr,
+        ScaleType const* scale_b_ptr,
+        ElementD* d_ptr,
+        int64_t n  // leading dimension of the output matrix
+    )
+        : accum_padding(0)
+        , ptr_scale_a(scale_a_ptr)
+        , null_default_a(0)
+        , padding1(0)
+        , compute0_padding(0)
+        , ptr_scale_b(scale_b_ptr)
+        , null_default_b(0)
+        , padding2(0)
+        , compute1_padding(0)
+        , ptr_d(d_ptr)
+        , stride_d_m(n)
+    {}
+};
+
+template <typename ElementA, typename ElementB, typename ScaleType, typename ElementD, typename LeadingDimElement,
+    typename ProblemShape, typename EpilogueParams>
 __global__ void configureGemmKernelWithVisitor(int num_experts, int const* cumsum_counter, ElementA* A, ElementB* B,
-    int64_t N, int64_t K, ElementA** ptr_A, ElementB** ptr_B, LeadingDimElement* lda, LeadingDimElement* ldb,
-    ProblemShape* problem_sizes_device)
+    ScaleType const* scales_a, ScaleType const* scales_b, ElementD* D, int64_t N, int64_t K, ElementA** ptr_A,
+    ElementB** ptr_B, LeadingDimElement* lda, LeadingDimElement* ldb, ProblemShape* problem_sizes_device,
+    EpilogueParams* epilogue_params_device)
 {
     int expert_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (expert_id < num_experts)
@@ -693,6 +763,13 @@ __global__ void configureGemmKernelWithVisitor(int num_experts, int const* cumsu
 
         ProblemShape problem = ProblemShape(M, N, K);
         problem_sizes_device[expert_id] = problem;
+
+        ScaleType const* ptr_scale_A = scales_a + cumsum_counter[expert_id];
+        ScaleType const* ptr_scale_B = scales_b + expert_id * N;
+        ElementD* ptr_D = D + cumsum_counter[expert_id] * N;
+
+        *reinterpret_cast<SimplifiedEpilogueParams<ScaleType, ElementD>*>(&epilogue_params_device[expert_id]) =
+            SimplifiedEpilogueParams<ScaleType, ElementD>(ptr_scale_A, ptr_scale_B, ptr_D, N);
     }
 }
 
@@ -809,29 +886,8 @@ struct moeGemmRowWiseFused
         constexpr int BLOCK_SIZE = 128;
         auto GRID_SIZE = (inputs.num_experts + BLOCK_SIZE - 1) / BLOCK_SIZE;
         configureGemmKernelWithVisitor<<<dim3(GRID_SIZE), dim3(BLOCK_SIZE), 0, inputs.stream>>>(inputs.num_experts,
-            inputs.cumsum_counter, block_A, block_B, inputs.N, inputs.K, ptr_A, ptr_B, lda, ldb,
-            problem_size_workspace);
-
-        // build epilogue params
-        std::vector<int> cumsum_counter_host(inputs.num_experts + 1);
-        std::vector<EpilogueParams> epilogue_params_host(inputs.num_experts);
-        cudaMemcpy(cumsum_counter_host.data(), inputs.cumsum_counter, (inputs.num_experts + 1) * sizeof(int),
-            cudaMemcpyDeviceToHost);
-        for (int i = 0; i < inputs.num_experts; i++)
-        {
-            auto problem
-                = cutlass::gemm::GemmCoord(cumsum_counter_host[i + 1] - cumsum_counter_host[i], inputs.N, inputs.K);
-            ScaleType const* ptr_scale_A = inputs.scales_a + cumsum_counter_host[i];
-            ScaleType const* ptr_scale_B = inputs.scales_b + i * inputs.N;
-            ElementD* ptr_D = inputs.D + cumsum_counter_host[i] * inputs.N;
-            typename FusionCallbacks::Arguments callback_args
-                = {{{{}, {ptr_scale_A, ScaleType(0), {_1{}, _0{}, _0{}}}, {}},
-                       {ptr_scale_B, ScaleType(0), {_0{}, _1{}, _0{}}}, {}},
-                    {ptr_D, {inputs.N, _1{}, _0{}}}};
-            epilogue_params_host[i] = FusionCallbacks::to_underlying_arguments(problem, callback_args, nullptr);
-        }
-        cudaMemcpyAsync(epilogue_params, epilogue_params_host.data(), inputs.num_experts * sizeof(EpilogueParams),
-            cudaMemcpyHostToDevice, inputs.stream);
+            inputs.cumsum_counter, block_A, block_B, inputs.scales_a, inputs.scales_b, inputs.D, inputs.N, inputs.K,
+            ptr_A, ptr_B, lda, ldb, problem_size_workspace, epilogue_params);
 
         int threadblock_count = GemmGrouped::sufficient(nullptr, inputs.num_experts);
         typename GemmGrouped::Arguments arguments(problem_size_workspace, inputs.num_experts, threadblock_count,
