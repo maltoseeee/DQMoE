@@ -44,6 +44,13 @@
 #include "torch_help.h"
 #include "util.h"
 
+#if CUB_VERSION >= 200800
+#include <cuda/std/functional>
+using CubMaxOp = CubMaxOp;
+#else   // if CUB_VERSION < 200800
+using CubMaxOp = cub::Max;
+#endif  // CUB_VERSION
+
 static size_t cubHistogramAndScan(void* workspace, size_t workspace_size, int const* d_indices, int* d_counts,
     int* d_cumsum, int num_elements, int num_experts, cudaStream_t stream = 0);
 
@@ -171,7 +178,7 @@ __global__ void perTensorDynamicFp8QuantKernel(InputType const* input_data, // I
     // Block-level reduction using CUB
     using BlockReduce = cub::BlockReduce<float, QUANTIZE_THREADS_PER_BLOCK>;
     __shared__ typename BlockReduce::TempStorage temp_storage;
-    float block_max = BlockReduce(temp_storage).Reduce(local_max, cuda::maximum<>{});
+    float block_max = BlockReduce(temp_storage).Reduce(local_max, CubMaxOp{});
     __syncthreads();
     // Update global maximum using atomic operation
     if (tid == 0)
@@ -245,7 +252,7 @@ __global__ void perTokendynamicFp8QuantKernel(
     // calculate for absmax
     using BlockReduce = cub::BlockReduce<float, QUANTIZE_THREADS_PER_BLOCK>;
     __shared__ typename BlockReduce::TempStorage tmp;
-    float block_max = BlockReduce(tmp).Reduce(local_max, cuda::maximum<>{});
+    float block_max = BlockReduce(tmp).Reduce(local_max, CubMaxOp{});
     __shared__ float shared_max;
     if (tid == 0)
     {
