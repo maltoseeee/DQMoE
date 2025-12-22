@@ -32,8 +32,13 @@
 #include "cutlass/util/reference/host/tensor_fill.h"
 #include "cutlass/util/reference/host/tensor_norm.h"
 #include "cutlass/util/tensor_view_io.h"
+#include "cutlass/epilogue/threadblock/fusion/visitors.hpp"
+#include "gemm_grouped_with_visitor.h"
+#include "default_gemm_grouped_with_visitor.h"
 #include "quantization.h"
 #include "util.h"
+
+using namespace cute;
 
 template <typename AType, typename BType, typename OType, typename ScaleType = float,
     typename QuantModeType = QuantMode::NONE>
@@ -61,6 +66,7 @@ struct GroupedGemmInput
     int sm = 80;
     std::string operation_name;
     cudaStream_t stream = 0;
+    bool fused = true;
 };
 
 template <typename ElementA, typename ElementB, typename ElementD, typename ElementBlockScale, typename StrideA,
@@ -666,6 +672,241 @@ struct moeGemmRowWise
     }
 };
 
+// A simple POD structure, can be constructed on host or device
+// Corresponds to EVTD = Sm80EVT<D, Sm80EVT<Compute1, Sm80EVT<Compute0, Accum, ScaleA>, ScaleB>>
+template<typename ScaleType, typename ElementD>
+struct SimplifiedEpilogueParams {
+    // The memory layout must be exactly the same as EpilogueParams.
+    //
+    // Memory layout derivation (based on the recursive structure of Sm80EVT):
+    //   EVTCompute0 = Sm80EVT<Compute0, Accum, ScaleA>
+    //     -> Params = tuple<Accum::Params(empty), ScaleA::Params(16B), Compute0::Params(empty)>
+    //     -> Total size: 32 bytes
+    //
+    //   EVTCompute1 = Sm80EVT<Compute1, EVTCompute0, ScaleB>
+    //     -> Params = tuple<EVTCompute0::Params(32B), ScaleB::Params(16B), Compute1::Params(empty)>
+    //     -> Total size: 56 bytes
+    //
+    //   EVTD = Sm80EVT<D, EVTCompute1>
+    //     -> Params = tuple<EVTCompute1::Params(56B), D::Params(16B)>
+    //     -> Total size: 72 bytes
+    //
+    // Actual memory layout (72 bytes total):
+    //
+    //   [EVTCompute1::Params - 56 bytes]
+    //     [EVTCompute0::Params - 32 bytes]
+    //       offset 0-7:   Accum::Params(empty,1B) + padding(7B) = 8 bytes
+    //       offset 8-23:  ScaleA::Params (ptr_col 8B, null_default 4B, padding 4B) = 16 bytes
+    //       offset 24-31: Compute0::Params(empty,1B) + padding(7B) = 8 bytes
+    //     [ScaleB::Params - 16 bytes]
+    //       offset 32-47: ScaleB::Params (ptr_row 8B, null_default 4B, padding 4B) = 16 bytes
+    //     [Compute1::Params - 8 bytes]
+    //       offset 48-55: Compute1::Params(empty,1B) + padding(7B) = 8 bytes
+    //   [D::Params - 16 bytes]
+    //     offset 56-71: D::Params (ptr_aux 8B, stride_m 8B) = 16 bytes
+    //
+
+    uint64_t accum_padding;              // offset 0:  Accum::Params(empty,1B) + padding(7B)
+    ScaleType const* ptr_scale_a;        // offset 8:  ScaleA::Params::ptr_col
+    ScaleType null_default_a;            // offset 16: ScaleA::Params::null_default (4B)
+    uint32_t padding1;                   // offset 20: Padding after ScaleA stride (4B)
+    uint64_t compute0_padding;           // offset 24: Compute0::Params(empty,1B) + padding(7B)
+    ScaleType const* ptr_scale_b;        // offset 32: ScaleB::Params::ptr_row
+    ScaleType null_default_b;            // offset 40: ScaleB::Params::null_default (4B)
+    uint32_t padding2;                   // offset 44: Padding after ScaleB stride (4B)
+    uint64_t compute1_padding;           // offset 48: Compute1::Params(empty,1B) + padding(7B)
+    ElementD* ptr_d;                     // offset 56: D::Params::ptr_aux
+    int64_t stride_d_m;                  // offset 64: D::Params::dAux (leading dimension)
+
+    // Constructor
+    CUTLASS_HOST_DEVICE
+    SimplifiedEpilogueParams(
+        ScaleType const* scale_a_ptr,
+        ScaleType const* scale_b_ptr,
+        ElementD* d_ptr,
+        int64_t n  // leading dimension of the output matrix
+    )
+        : accum_padding(0)
+        , ptr_scale_a(scale_a_ptr)
+        , null_default_a(0)
+        , padding1(0)
+        , compute0_padding(0)
+        , ptr_scale_b(scale_b_ptr)
+        , null_default_b(0)
+        , padding2(0)
+        , compute1_padding(0)
+        , ptr_d(d_ptr)
+        , stride_d_m(n)
+    {}
+};
+
+template <typename ElementA, typename ElementB, typename ScaleType, typename ElementD, typename LeadingDimElement,
+    typename ProblemShape, typename EpilogueParams>
+__global__ void configureGemmKernelWithVisitor(int num_experts, int const* cumsum_counter, ElementA* A, ElementB* B,
+    ScaleType const* scales_a, ScaleType const* scales_b, ElementD* D, int64_t N, int64_t K, ElementA** ptr_A,
+    ElementB** ptr_B, LeadingDimElement* lda, LeadingDimElement* ldb, ProblemShape* problem_sizes_device,
+    EpilogueParams* epilogue_params_device)
+{
+    static_assert(sizeof(SimplifiedEpilogueParams<ScaleType, ElementD>) == sizeof(EpilogueParams),
+            "SimplifiedEpilogueParams size must match EpilogueParams size");
+
+    int expert_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (expert_id < num_experts)
+    {
+        int start_idx = cumsum_counter[expert_id];
+        int end_idx = cumsum_counter[expert_id + 1];
+        int M = end_idx - start_idx;
+
+        ptr_A[expert_id] = A + start_idx * K;
+        ptr_B[expert_id] = B + expert_id * K * N;
+
+        lda[expert_id] = K;
+        // NOTE ColumnMajor
+        ldb[expert_id] = K;
+
+        ProblemShape problem = ProblemShape(M, N, K);
+        problem_sizes_device[expert_id] = problem;
+
+        ScaleType const* ptr_scale_A = scales_a + cumsum_counter[expert_id];
+        ScaleType const* ptr_scale_B = scales_b + expert_id * N;
+        ElementD* ptr_D = D + cumsum_counter[expert_id] * N;
+
+        *reinterpret_cast<SimplifiedEpilogueParams<ScaleType, ElementD>*>(&epilogue_params_device[expert_id]) =
+            SimplifiedEpilogueParams<ScaleType, ElementD>(ptr_scale_A, ptr_scale_B, ptr_D, N);
+    }
+}
+
+template <typename T, typename WeightType, typename GemmOutputType, typename ScaleType, typename arch,
+    typename QuantModeType, typename std::enable_if_t<std::is_same_v<QuantModeType, QuantMode::FP8_ROWWISE>>* = nullptr>
+struct moeGemmRowWiseFused
+{
+    using ElementA = typename NvToCutlassTypeAdapter<T>::type;          // Element type for
+                                                                        // A matrix operand
+    using ElementB = typename NvToCutlassTypeAdapter<WeightType>::type; // Element type for
+                                                                        // B matrix operand
+    using ElementC = GemmOutputType;
+    // D matrix configuration
+    using ElementD = ElementC;
+    using ElementCompute = float;
+    using ElementAccumulator = float;
+
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    using LayoutD = LayoutC;
+
+    constexpr static int ElementsPerAccessA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    constexpr static int ElementsPerAccessB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    constexpr static int ElementsPerAccessC = 128 / cutlass::sizeof_bits<ElementC>::value;
+    constexpr static int EVTEpilogueStages = 1;
+    using LeadingDimElement = int64_t;
+
+    using ThreadblockShape    = cutlass::gemm::GemmShape<64, 128, 64>;   // Threadblock-level tile size (concept: GemmShape)
+    using WarpShape           = cutlass::gemm::GemmShape<64, 32, 64>;    // Warp-level tile size (concept: GemmShape)
+    using InstructionShape    = cutlass::gemm::GemmShape<16, 8, 32>;     // Instruction-level tile size (concept: GemmShape)
+
+    using OutputTileThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<
+        ThreadblockShape,
+        WarpShape,
+        ElementC,
+        ElementsPerAccessC,
+        EVTEpilogueStages
+    >;
+
+    using Accum = cutlass::epilogue::threadblock::VisitorAccFetch;
+
+    using ScaleA = cutlass::epilogue::threadblock::VisitorColBroadcast<
+        OutputTileThreadMap, ScaleType,
+        cute::Stride<_1, _0, _0>
+    >;
+
+    using ScaleB = cutlass::epilogue::threadblock::VisitorRowBroadcast<
+        OutputTileThreadMap, ScaleType,
+        cute::Stride<_0, _1, _0>
+    >;
+
+    using Compute0 = cutlass::epilogue::threadblock::VisitorCompute<
+        cutlass::multiplies, ElementCompute, ElementCompute,
+        cutlass::FloatRoundStyle::round_to_nearest
+    >;
+
+    using EVTCompute0 = cutlass::epilogue::threadblock::Sm80EVT<
+        Compute0,
+        Accum,
+        ScaleA>;
+
+    using Compute1 = cutlass::epilogue::threadblock::VisitorCompute<
+        cutlass::multiplies, ElementCompute, ElementCompute,
+        cutlass::FloatRoundStyle::round_to_nearest
+    >;
+
+    using EVTCompute1 = cutlass::epilogue::threadblock::Sm80EVT<
+        Compute1,
+        EVTCompute0,
+        ScaleB>;
+
+    using D = cutlass::epilogue::threadblock::VisitorAuxStore<
+        OutputTileThreadMap, ElementD, cutlass::FloatRoundStyle::round_to_nearest,
+        cute::Stride<int64_t, _1, _0>
+    >;
+
+    using EVTD = cutlass::epilogue::threadblock::Sm80EVT<
+        D,
+        EVTCompute1>;
+
+    using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGroupedWithVisitor<ElementA, LayoutA,
+        cutlass::ComplexTransform::kNone, ElementsPerAccessA, ElementB, LayoutB, cutlass::ComplexTransform::kNone,
+        ElementsPerAccessB, ElementD, LayoutD, ElementAccumulator, cutlass::arch::OpClassTensorOp, cutlass::arch::Sm89,
+        ThreadblockShape, WarpShape, InstructionShape, EVTD,
+        // NOTE: Threadblock swizzling is currently not supported by CUTLASS's
+        // grouped kernels. This parameter is passed in at present to match the
+        // APIs of other kernels. The parameter is unused within the kernel.
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, 4, EVTEpilogueStages>::GemmKernel;
+    using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
+
+    using FusionCallbacks = typename GemmKernel::FusionCallbacks;
+    using EpilogueParams = typename FusionCallbacks::Params;
+
+    static void call(GroupedGemmInput<T, WeightType, GemmOutputType, ScaleType, QuantModeType>& inputs)
+    {
+        auto block_A = (ElementA*) inputs.A;
+        auto block_B = (ElementB*) inputs.B;
+        // auto block_C = (ElementC*)inputs.C;
+        auto block_D = (ElementD*) inputs.pending_dq_output;
+
+        auto ptr_A = (ElementA**) (inputs.workspace_ptr);
+        auto ptr_B = (ElementB**) (ptr_A + inputs.num_experts);
+
+        auto lda = (LeadingDimElement*) (align_pointer(ptr_B + inputs.num_experts));
+        auto ldb = (LeadingDimElement*) (align_pointer(lda + inputs.num_experts));
+
+        auto problem_size_workspace = (cutlass::gemm::GemmCoord*) (align_pointer(ldb + inputs.num_experts));
+
+        auto epilogue_params = (EpilogueParams*) (align_pointer(problem_size_workspace + inputs.num_experts));
+
+        auto gemm_workspace = (uint8_t*) (align_pointer(epilogue_params + inputs.num_experts));
+
+        constexpr int BLOCK_SIZE = 128;
+        auto GRID_SIZE = (inputs.num_experts + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        configureGemmKernelWithVisitor<<<dim3(GRID_SIZE), dim3(BLOCK_SIZE), 0, inputs.stream>>>(inputs.num_experts,
+            inputs.cumsum_counter, block_A, block_B, inputs.scales_a, inputs.scales_b, inputs.D, inputs.N, inputs.K,
+            ptr_A, ptr_B, lda, ldb, problem_size_workspace, epilogue_params);
+
+        int threadblock_count = GemmGrouped::sufficient(nullptr, inputs.num_experts);
+        typename GemmGrouped::Arguments arguments(problem_size_workspace, inputs.num_experts, threadblock_count,
+            epilogue_params, ptr_A, ptr_B, lda, ldb, (cutlass::gemm::GemmCoord*) nullptr);
+
+        GemmGrouped gemm;
+
+        // Check if the problem size is supported or not
+        CUTLASS_CHECK(gemm.can_implement(arguments));
+
+        // Initialize CUTLASS kernel with arguments and workspace pointer
+        CUTLASS_CHECK(gemm.initialize(arguments, gemm_workspace, inputs.stream));
+        CUTLASS_CHECK(gemm.run(inputs.stream));
+    }
+};
+
 template <typename T,          /*The type used for activations/scales/compute*/
     typename WeightType,       /* The type for the MoE weights */
     typename OutputType,       /* The output type for the GEMM */
@@ -718,8 +959,8 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleType>::getMaxWorkspaceSize(
 {
     // 预分配 CUTLASS GEMM 所需参数空间
     // 包含：stride、ptr、problem size、leading dimension 和 workspace
-    // 经验表明 16MB 可满足当前所有 GEMM 场景，避免重复计算开销
-    return 16 * 1024 * 1024;
+    // 经验表明 18MB 可满足当前所有 GEMM 场景，避免重复计算开销
+    return 18 * 1024 * 1024;
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleType>
@@ -736,7 +977,14 @@ void dispatchMoeGemm(GroupedGemmInput<T, WeightType, GemmOutputType, ScaleType, 
 {
     if constexpr (arch::kMinComputeCapability >= 89 && std::is_same_v<QuantModeType, QuantMode::FP8_ROWWISE>)
     {
-        moeGemmRowWise<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType>::call(inputs);
+        if (inputs.fused)
+        {
+            moeGemmRowWiseFused<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType>::call(inputs);
+        }
+        else
+        {
+            moeGemmRowWise<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType>::call(inputs);
+        }
     }
     else if constexpr (arch::kMinComputeCapability >= 89 && std::is_same_v<QuantModeType, QuantMode::FP8_QDQ>)
     {

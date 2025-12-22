@@ -44,6 +44,13 @@
 #include "torch_help.h"
 #include "util.h"
 
+#if CUB_VERSION >= 200800
+#include <cuda/std/functional>
+using CubMaxOp = CubMaxOp;
+#else   // if CUB_VERSION < 200800
+using CubMaxOp = cub::Max;
+#endif  // CUB_VERSION
+
 static size_t cubHistogramAndScan(void* workspace, size_t workspace_size, int const* d_indices, int* d_counts,
     int* d_cumsum, int num_elements, int num_experts, cudaStream_t stream = 0);
 
@@ -65,13 +72,13 @@ public:
     void runMoe(void const* expert_inputs, void const* expert_weights1, void const* expert_weights2,
         int const* topk_indices, void const* expert_bias1, void const* expert_bias2, void* final_output,
         QuantMode quant_mode, QuantParams quant_param, int num_experts, int topk, int num_tokens, int hidden_size,
-        int inter_size, char* workspace, cudaStream_t stream);
+        int inter_size, char* workspace, cudaStream_t stream, bool fused = true);
 
     void runMoeWithTorchDebug(void const* expert_inputs, void const* expert_weights1, void const* expert_weights2,
         int const* topk_indices, void const* expert_bias1, void const* expert_bias2, void* final_output,
         QuantMode quant_mode, QuantParams quant_params, int num_experts, int topk, int num_tokens, int hidden_size,
         int inter_size, char* workspace, cudaStream_t stream,
-        std::map<std::string, std::pair<void*, size_t>> intermediate_map);
+        std::map<std::string, std::pair<void*, size_t>> intermediate_map, bool fused = true);
 
 private:
     size_t gemm_workspace_size_;
@@ -81,7 +88,7 @@ private:
     void Gemm(T const* expert_inputs, WeightType const* expert_weights, int const* d_counts,
         int const* d_cumsum_counter, OutputType* gemm_output, float* pending_dq_output, QuantMode const& quant_mode,
         ScaleType const* scale_a, ScaleType const* scale_b, int num_experts, int num_tokens, int topk, int N, int K,
-        char* workspace, size_t workspace_size, std::string operation_name, cudaStream_t stream);
+        char* workspace, size_t workspace_size, std::string operation_name, cudaStream_t stream, bool fused);
 
     void extractIntermediateResultsforTorch(char* workspace, int num_experts, int topk, int bs, int hidden_size,
         int inter_size, QuantMode quant_mode, std::map<std::string, std::pair<void*, size_t>> intermediate_map,
@@ -171,7 +178,7 @@ __global__ void perTensorDynamicFp8QuantKernel(InputType const* input_data, // I
     // Block-level reduction using CUB
     using BlockReduce = cub::BlockReduce<float, QUANTIZE_THREADS_PER_BLOCK>;
     __shared__ typename BlockReduce::TempStorage temp_storage;
-    float block_max = BlockReduce(temp_storage).Reduce(local_max, cuda::maximum<>{});
+    float block_max = BlockReduce(temp_storage).Reduce(local_max, CubMaxOp{});
     __syncthreads();
     // Update global maximum using atomic operation
     if (tid == 0)
@@ -245,7 +252,7 @@ __global__ void perTokendynamicFp8QuantKernel(
     // calculate for absmax
     using BlockReduce = cub::BlockReduce<float, QUANTIZE_THREADS_PER_BLOCK>;
     __shared__ typename BlockReduce::TempStorage tmp;
-    float block_max = BlockReduce(tmp).Reduce(local_max, cuda::maximum<>{});
+    float block_max = BlockReduce(tmp).Reduce(local_max, CubMaxOp{});
     __shared__ float shared_max;
     if (tid == 0)
     {
@@ -719,10 +726,10 @@ void MoeFCRunner<T, WeightType, OutputType, ScaleType, Enable>::runMoeWithTorchD
     void const* expert_weights1, void const* expert_weights2, int const* topk_indices, void const* expert_bias1,
     void const* expert_bias2, void* final_output, QuantMode quant_mode, QuantParams quant_params, int num_experts,
     int topk, int bs, int hidden_size, int inter_size, char* workspace, cudaStream_t stream,
-    std::map<std::string, std::pair<void*, size_t>> intermediate_map)
+    std::map<std::string, std::pair<void*, size_t>> intermediate_map, bool fused)
 {
     runMoe(expert_inputs, expert_weights1, expert_weights2, topk_indices, expert_bias1, expert_bias2, final_output,
-        quant_mode, quant_params, num_experts, topk, bs, hidden_size, inter_size, workspace, stream);
+        quant_mode, quant_params, num_experts, topk, bs, hidden_size, inter_size, workspace, stream, fused);
 
     //   extractIntermediateResultsforTorch(workspace, num_experts, topk, bs,
     //                                      hidden_size, inter_size, quant_mode,
@@ -763,7 +770,7 @@ template <class T, class WeightType, class OutputType, class ScaleType, class En
 void MoeFCRunner<T, WeightType, OutputType, ScaleType, Enable>::runMoe(void const* expert_inputs,
     void const* expert_weights1, void const* expert_weights2, int const* topk_indices, void const* expert_bias1,
     void const* expert_bias2, void* final_output, QuantMode quant_mode, QuantParams quant_param, int num_experts,
-    int topk, int num_tokens, int hidden_size, int inter_size, char* workspace, cudaStream_t stream)
+    int topk, int num_tokens, int hidden_size, int inter_size, char* workspace, cudaStream_t stream, bool fused)
 {
     // Cast inputs to proper types
     T const* inputs = static_cast<T const*>(expert_inputs);
@@ -840,7 +847,7 @@ void MoeFCRunner<T, WeightType, OutputType, ScaleType, Enable>::runMoe(void cons
     // Step 4: First GEMM
     Gemm(gathered_inputs, weights1, d_counts, d_cumsum_counter, gemm1_output, gemm1_pending_dq_output, quant_mode,
         gathered_input_scales, quant_param.fp8.weight1_scales, num_experts, num_tokens, topk, inter_size * 2,
-        hidden_size, gemm_workspace, gemm_workspace_size, "GEMM1", stream);
+        hidden_size, gemm_workspace, gemm_workspace_size, "GEMM1", stream, fused);
 
     // Step 5: Gated activation
     launchGatedActivation(gemm1_output, activation_output, num_elements, inter_size, stream);
@@ -873,7 +880,7 @@ void MoeFCRunner<T, WeightType, OutputType, ScaleType, Enable>::runMoe(void cons
     // Step 7: Second GEMM
     Gemm(quantized_activation, weights2, d_counts, d_cumsum_counter, gemm2_output, gemm2_pending_dq_output, quant_mode,
         d_dynamic_scale_workspace, quant_param.fp8.weight2_scales, num_experts, num_tokens, topk, hidden_size,
-        inter_size, gemm_workspace, gemm_workspace_size, "GEMM2", stream);
+        inter_size, gemm_workspace, gemm_workspace_size, "GEMM2", stream, fused);
 
     // CUDA_CHECK(cudaStreamSynchronize(stream));
     // Step 8: Scatter the expert-grouped output back to original token
@@ -889,7 +896,7 @@ void MoeFCRunner<T, WeightType, OutputType, ScaleType, Enable>::Gemm(T const* ex
     WeightType const* expert_weights, int const* d_counts, int const* d_cumsum_counter, OutputType* gemm_output,
     float* pending_dq_output, QuantMode const& quant_mode, ScaleType const* scale_a, ScaleType const* scale_b,
     int num_experts, int num_tokens, int topk, int N, int K, char* workspace, size_t workspace_size,
-    std::string operation_name, cudaStream_t stream)
+    std::string operation_name, cudaStream_t stream, bool fused)
 {
 #define RUN_GEMM_WITH_QUANTMODE(QUANT_MODE)                                                                            \
     do                                                                                                                 \
@@ -912,7 +919,8 @@ void MoeFCRunner<T, WeightType, OutputType, ScaleType, Enable>::Gemm(T const* ex
             .workspace_ptr = workspace,                                                                                \
             .sm = moe_gemm_runner_.getSM(),                                                                            \
             .operation_name = operation_name,                                                                          \
-            .stream = stream};                                                                                         \
+            .stream = stream,                                                                                          \
+            .fused = fused};                                                                                           \
         moe_gemm_runner_.runGemm(gemm_input);                                                                          \
     } while (0)
 

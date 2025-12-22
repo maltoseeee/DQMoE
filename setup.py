@@ -38,6 +38,7 @@ nvcc_flags = [
     "--expt-extended-lambda",
     "--use_fast_math",
     "-gencode=arch=compute_86,code=sm_86",
+    "-gencode=arch=compute_89,code=sm_89",
     "-gencode=arch=compute_90,code=sm_90",
     "-gencode=arch=compute_90a,code=sm_90a",
     f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}",
@@ -54,6 +55,7 @@ build_include_dirs = [
     f"{CUDA_HOME}/include",
     f"{CUDA_HOME}/include/cccl",
     f"{current_dir}/third_party/cutlass/include",
+    f"{current_dir}/third_party/cutlass/tools/util/include",
 ]
 build_libraries = ["cuda", "cudart", "nvrtc"]
 build_library_dirs = [f"{CUDA_HOME}/lib64", f"{CUDA_HOME}/lib64/stubs"]
