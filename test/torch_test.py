@@ -177,7 +177,7 @@ def test(compute_capability: int):
         0,
         util.generate_non_quant,
         moe_test.m_grouped_moe_nt_contiguous_bf16,
-        "GemmGrouped",
+        "GemmUniversal",
     )
     if compute_capability == 89:
         test_dynamic_quantization_moe(

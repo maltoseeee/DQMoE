@@ -375,6 +375,93 @@ def build_fp32_engine():
     with open("test_fp32.engine", "wb") as f:
         f.write(engine)
 
+def build_fp16_engine():
+    TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(TRT_LOGGER)
+    network = builder.create_network(
+        1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+    )
+    config = builder.create_builder_config()
+
+    input_tensor = network.add_input(
+        "input", trt.DataType.HALF, (max_num_tokens, hidden_size)
+    )
+    weight1 = network.add_input(
+        "weight1", trt.DataType.HALF, (num_experts, inter_size * 2, hidden_size)
+    )
+    weight2 = network.add_input(
+        "weight2", trt.DataType.HALF, (num_experts, hidden_size, inter_size)
+    )
+    index_tensor = network.add_input(
+        "index", trt.DataType.INT32, (max_num_tokens, top_k)
+    )
+
+    bias1 = network.add_constant(
+        weight1.shape, np.zeros(tuple(weight1.shape), dtype=np.float32)
+    ).get_output(0)
+    bias2 = network.add_constant(
+        weight2.shape, np.zeros(tuple(weight2.shape), dtype=np.float32)
+    ).get_output(0)
+
+    registry = trt.get_plugin_registry()
+    creator = registry.get_plugin_creator("mixture_of_experts", "1.0")
+    assert creator, "Plugin not found!"
+
+    fields = [
+        trt.PluginField(
+            "number_of_experts",
+            np.array([num_experts], np.int32),
+            trt.PluginFieldType.INT32,
+        ),
+        trt.PluginField(
+            "top_k", np.array([top_k], np.int32), trt.PluginFieldType.INT32
+        ),
+        trt.PluginField(
+            "expert_hidden_size",
+            np.array([hidden_size], np.int32),
+            trt.PluginFieldType.INT32,
+        ),
+        trt.PluginField(
+            "expert_inter_size",
+            np.array([inter_size], np.int32),
+            trt.PluginFieldType.INT32,
+        ),
+        trt.PluginField(
+            "max_num_tokens",
+            np.array([max_num_tokens], np.int32),
+            trt.PluginFieldType.INT32,
+        ),
+        trt.PluginField("use_bias", np.array([0], np.int32), trt.PluginFieldType.INT32),
+        trt.PluginField(
+            "type",
+            np.array([int(trt.DataType.HALF)], np.int32),
+            trt.PluginFieldType.INT32,
+        ),
+        trt.PluginField(
+            "output_type",
+            np.array([int(trt.DataType.HALF)], np.int32),
+            trt.PluginFieldType.INT32,
+        ),
+        trt.PluginField(
+            "quant_mode", np.array([0], np.int32), trt.PluginFieldType.INT32
+        ),
+    ]
+    plugin = creator.create_plugin(
+        "mixture_of_experts", trt.PluginFieldCollection(fields)
+    )
+
+    inputs = [input_tensor, weight1, weight2, index_tensor, bias1, bias2]
+    layer = network.add_plugin_v2(inputs, plugin)
+    layer = network.add_cast(layer.get_output(0), trt.DataType.FLOAT)
+    layer.get_output(0).name = "output"
+    network.mark_output(layer.get_output(0))
+
+    engine = builder.build_serialized_network(network, config)
+    assert engine, "FP16 engine build failed!"
+    if isinstance(engine, trt.ICudaEngine):
+        engine = engine.serialize()
+    with open("test_fp16.engine", "wb") as f:
+        f.write(engine)
 
 # === Inference ===
 def infer_trt_torch(engine_path, buffer_dict):
@@ -410,6 +497,7 @@ if __name__ == "__main__":
 
     # Build engines only if not exists
     build_engine_if_not_exists("test_fp32.engine", build_fp32_engine)
+    build_engine_if_not_exists("test_fp16.engine", build_fp16_engine)
     build_engine_if_not_exists("test_fp8.engine", build_fp8_engine)
     build_engine_if_not_exists("test_block_fp8.engine", build_block_fp8_engine)
 
@@ -431,6 +519,13 @@ if __name__ == "__main__":
         "input": input_t,
         "weight1": weight1_t,
         "weight2": weight2_t,
+        "index": index_t,
+    }
+
+    input_dict_fp16 = {
+        "input": input_t.half(),
+        "weight1": weight1_t.half(),
+        "weight2": weight2_t.half(),
         "index": index_t,
     }
 
@@ -468,7 +563,9 @@ if __name__ == "__main__":
     out_block_fp8 = infer_trt_torch("test_block_fp8.engine", input_dict_block_fp8)[
         "output"
     ]
+    out_fp16 = infer_trt_torch("test_fp16.engine", input_dict_fp16)["output"]
     print(out_fp32)
+    print(out_fp16)
     print(out_fp8)
     print(out_block_fp8)
 

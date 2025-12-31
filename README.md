@@ -28,7 +28,7 @@
 
 ### 1. 克隆项目
 ```bash
-git clone --recursive https://github.com/maltoseeee/moe.git
+git clone --recursive https://github.com/maltoseeee/DQMoE.git
 cd moe
 ```
 
