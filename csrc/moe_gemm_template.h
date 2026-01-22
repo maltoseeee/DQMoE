@@ -110,8 +110,26 @@ __global__ void configureTmaWarpSpecializeBlockWiseGemmKernel(int num_experts, i
     }
 }
 
+struct PingpongConfig
+{
+    using ElementA = cutlass::float_e4m3_t;
+    using TileShape = cute::Shape<cute::_64, cute::_128, cute::_128>;
+    using ClusterShape = cute::Shape<cute::_2, cute::_1, cute::_1>;
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongFP8BlockScaledAccum;
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedPingpong;
+};
+
+  struct CooperativeConfig {
+    using ElementA = cutlass::float_e4m3_t;
+    using TileShape = cute::Shape<cute::_128, cute::_128, cute::_128>;
+    using ClusterShape = cute::Shape<cute::_1, cute::_2, cute::_1>;
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+  };
+
+
 template <typename T, typename WeightType, typename GemmOutputType, typename ScaleType, typename arch,
-    typename QuantModeType,
+    typename QuantModeType, typename MmaConfig,
     typename std::enable_if_t<std::is_same_v<T, __nv_fp8_e4m3> && std::is_same_v<WeightType, T>
         && std::is_same_v<QuantModeType, QuantMode::FP8_BLOCKWISE>>* = nullptr>
 struct moeGemmTmaWarpSpecializedBlockWise
@@ -155,10 +173,13 @@ struct moeGemmTmaWarpSpecializedBlockWise
     using ArchTag = cutlass::arch::Sm90;                  // Tag indicating the minimum SM that
                                                           // supports the intended feature
     using OperatorClass = cutlass::arch::OpClassTensorOp; // Operator class tag
-    using TileShape = cute::Shape<cute::_128, cute::_128,
-        cute::_128>; // Threadblock-level tile size
-    using ClusterShape = cute::Shape<cute::_1, cute::_2,
-        cute::_1>; // Shape of the threadblocks in a cluster
+    // using TileShape = cute::Shape<cute::_128, cute::_128,
+    //     cute::_128>; // Threadblock-level tile size
+    // using ClusterShape = cute::Shape<cute::_1, cute::_2,
+    //     cute::_1>; // Shape of the threadblocks in a cluster
+
+    using TileShape = typename MmaConfig::TileShape;           // Threadblock-level tile size
+    using ClusterShape = typename MmaConfig::ClusterShape;     // Shape of the threadblocks in a cluster
 
     constexpr static int ScaleGranularityM = 1;
     constexpr static int ScaleGranularityN = 128;
@@ -172,14 +193,21 @@ struct moeGemmTmaWarpSpecializedBlockWise
     using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB()); // Layout type for SFB
                                                                  // matrix operand
 
-    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
-    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative;
+    using KernelSchedule = typename MmaConfig::KernelSchedule;
+    using EpilogueSchedule = typename MmaConfig::EpilogueSchedule;
     using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
-    using FusionOperation = cutlass::epilogue::fusion::LinearCombination<ElementC, ElementAccumulator>;
+    // using FusionOperation = cutlass::epilogue::fusion::LinearCombination<ElementC, ElementAccumulator>;
+    static constexpr auto RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
+    using CustomEVTIdentity =  // acc
+        cutlass::epilogue::fusion::Sm90EVT<
+        cutlass::epilogue::fusion::Sm90Compute<
+            cutlass::epilogue::thread::Identity, ElementD, ElementAccumulator, RoundStyle>,
+        cutlass::epilogue::fusion::Sm90AccFetch
+        >;
 
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag, OperatorClass,
         TileShape, ClusterShape, EpilogueTileType, ElementAccumulator, ElementCompute, ElementC, LayoutC*, AlignmentC,
-        ElementD, LayoutD*, AlignmentD, EpilogueSchedule, FusionOperation>::CollectiveOp;
+        ElementD, LayoutD*, AlignmentD, EpilogueSchedule, CustomEVTIdentity>::CollectiveOp;
 
     using CollectiveMainloopWithGroupWiseScaling = typename cutlass::gemm::collective::CollectiveBuilder<ArchTag,
         OperatorClass, ElementA, cute::tuple<LayoutA*, LayoutSFA*>, AlignmentA, ElementB,
@@ -210,32 +238,6 @@ struct moeGemmTmaWarpSpecializedBlockWise
     {
         static cutlass::KernelHardwareInfo kernel_hw_info
             = cutlass::KernelHardwareInfo::make_kernel_hardware_info<typename Gemm::GemmKernel>(0 /*device_id*/);
-        // if (inputs.workspace_ptr == nullptr && inputs.workspace_size == 0)
-        // {
-        //     auto& workspace_size = inputs.workspace_size;
-        //     workspace_size = 0;
-
-        //     workspace_size += align_size(inputs.num_experts
-        //             * (sizeof(ElementA*) + sizeof(ElementB*) +
-        //             sizeof(ElementC*) + sizeof(ElementD*)
-        //                 + sizeof(ElementBlockScale*) +
-        //                 sizeof(ElementBlockScale*)),
-        //         CUDA_MEM_ALIGN);
-        //     workspace_size += align_size(inputs.num_experts
-        //             * (sizeof(StrideA) + sizeof(StrideB) + sizeof(StrideC) +
-        //             sizeof(StrideD) + sizeof(LayoutSFA)
-        //                 + sizeof(LayoutSFB)),
-        //         CUDA_MEM_ALIGN);
-        //     workspace_size += align_size(
-        //         inputs.num_experts * sizeof(typename
-        //         ProblemShape::UnderlyingProblemShape), CUDA_MEM_ALIGN);
-
-        //     workspace_size += align_size(
-        //         128 * 1024, CUDA_MEM_ALIGN); // workspace for cutlass kernel:
-        //         experiential use (84480 bytes).
-
-        //     return;
-        // }
 
         auto block_A = (ElementA const*) inputs.A;
         auto block_B = (ElementB const*) inputs.B;
@@ -272,25 +274,25 @@ struct moeGemmTmaWarpSpecializedBlockWise
             {inputs.num_experts, problem_sizes, (typename ProblemShape::UnderlyingProblemShape*) nullptr},
             {ptr_A, stride_A, ptr_B, stride_B, ptr_blockscale_A, layout_SFA, ptr_blockscale_B, layout_SFB},
             {{}, // epilogue.thread
-                ptr_C, stride_C, ptr_D, stride_D},
+                nullptr, stride_C, ptr_D, stride_D},
             kernel_hw_info};
 
-        auto& fusion_args = arguments.epilogue.thread;
+        // auto& fusion_args = arguments.epilogue.thread;
 
-        fusion_args.alpha = 1.0;
-        fusion_args.beta = 0.0;
-        fusion_args.alpha_ptr = nullptr;
-        fusion_args.beta_ptr = nullptr;
-        fusion_args.alpha_ptr_array = nullptr;
-        fusion_args.beta_ptr_array = nullptr;
-        // Single alpha and beta for all groups
-        fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
-        fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+        // fusion_args.alpha = 1.0;
+        // fusion_args.beta = 0.0;
+        // fusion_args.alpha_ptr = nullptr;
+        // fusion_args.beta_ptr = nullptr;
+        // fusion_args.alpha_ptr_array = nullptr;
+        // fusion_args.beta_ptr_array = nullptr;
+        // // Single alpha and beta for all groups
+        // fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
+        // fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
 
-        arguments.scheduler.raster_order = RasterOrderOptions::Heuristic;
+        // arguments.scheduler.raster_order = RasterOrderOptions::Heuristic;
         // The tile scheduler will swizzle up to 8 and with the nearest multiple
         // of 2 (i.e., 1, 2, 4, and 8)
-        arguments.scheduler.max_swizzle_size = 1;
+        // arguments.scheduler.max_swizzle_size = 1;
         Gemm gemm;
 
         // Allocate workspace memory
@@ -1137,7 +1139,13 @@ void dispatchMoeGemmTmaWarpSpecialized(GroupedGemmInput<T, WeightType, GemmOutpu
 {
     if constexpr (std::is_same_v<QuantModeType, QuantMode::FP8_BLOCKWISE>)
     {
-        moeGemmTmaWarpSpecializedBlockWise<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType>::call(inputs);
+        if (inputs.K <= 128)
+        {
+            moeGemmTmaWarpSpecializedBlockWise<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType, CooperativeConfig>::call(inputs);
+        } else
+        {
+            moeGemmTmaWarpSpecializedBlockWise<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType, PingpongConfig>::call(inputs);
+        }
     }
     else if constexpr (std::is_same_v<QuantModeType, QuantMode::FP8_ROWWISE>
         || std::is_same_v<QuantModeType, QuantMode::FP8_QDQ> || std::is_same_v<T, float>)
