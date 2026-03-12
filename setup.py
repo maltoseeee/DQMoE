@@ -41,6 +41,8 @@ nvcc_flags = [
     "-gencode=arch=compute_89,code=sm_89",
     "-gencode=arch=compute_90,code=sm_90",
     "-gencode=arch=compute_90a,code=sm_90a",
+    "-gencode=arch=compute_100,code=sm_100",
+    "--gencode=arch=compute_100a,code=sm_100a",
     f"-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
