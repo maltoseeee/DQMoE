@@ -81,7 +81,7 @@ __global__ void configureTmaWarpSpecializeBlockWiseGemmKernel(int num_experts, i
     constexpr int ScaleGranularityM = 1;
     constexpr int ScaleGranularityN = 128;
     constexpr int ScaleGranularityK = 128;
-    using ScaleConfig = Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK, cute::UMMA::Major::K, cute::UMMA::Major::K>;
+    using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK, cute::UMMA::Major::K, cute::UMMA::Major::K>;
     int expert_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (expert_id < num_experts)
     {
@@ -359,7 +359,7 @@ struct moeGemmTmaWarpSpecializedSM100BlockWise
     constexpr static int ScaleGranularityN = 128;
     constexpr static int ScaleGranularityK = 128;
 
-    using ScaleConfig = Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK, cute::UMMA::Major::K, cute::UMMA::Major::K>;
+    using ScaleConfig = cutlass::detail::Sm100BlockwiseScaleConfig<ScaleGranularityM, ScaleGranularityN, ScaleGranularityK, cute::UMMA::Major::K, cute::UMMA::Major::K>;
 
     using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA()); // Layout type for SFA
                                                                  // matrix operand
@@ -1302,8 +1302,18 @@ void dispatchMoeGemmTmaWarpSpecialized(GroupedGemmInput<T, WeightType, GemmOutpu
             moeGemmTmaWarpSpecializedSM100BlockWise<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType>::call(inputs);
         }
     }
-    else if constexpr (std::is_same_v<QuantModeType, QuantMode::FP8_ROWWISE>
-        || std::is_same_v<QuantModeType, QuantMode::FP8_QDQ> || std::is_same_v<T, float>)
+    else if constexpr (std::is_same_v<QuantModeType, QuantMode::NONE>)
+    {
+        if constexpr (arch::kMinComputeCapability == 90 && !std::is_same_v<T, float>)
+        {
+            moeGemmTmaWarpSpecialized<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType>::call(inputs);
+        }
+        else
+        {
+            dispatchMoeGemm<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType>(inputs);
+        }
+    }
+    else
     {
         // std::cout << "[警告]: " << inputs.operation_name
         //           << " 使用的 quant mode: " << inputs.quant_mode.toQuantAlgo()
@@ -1312,10 +1322,6 @@ void dispatchMoeGemmTmaWarpSpecialized(GroupedGemmInput<T, WeightType, GemmOutpu
         //              "这是为保证向后兼容旧硬件的低效算法实现, 不推荐在 sm "
         //           << inputs.sm << " 上使用. " << std::endl;
         dispatchMoeGemm<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType>(inputs);
-    }
-    else
-    {
-        moeGemmTmaWarpSpecialized<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType>::call(inputs);
     }
 }
 

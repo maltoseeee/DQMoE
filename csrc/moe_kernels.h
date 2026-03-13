@@ -44,10 +44,10 @@
 #include "torch_help.h"
 #include "util.h"
 
-#if CUB_VERSION >= 200800
-#include <cuda/std/functional>
-using CubMaxOp = CubMaxOp;
-#else   // if CUB_VERSION < 200800
+#if CUB_VERSION >= 200800 // CCCL 2.8.0
+#include <cuda/functional>
+using CubMaxOp = cuda::maximum<>;
+#else
 using CubMaxOp = cub::Max;
 #endif  // CUB_VERSION
 
