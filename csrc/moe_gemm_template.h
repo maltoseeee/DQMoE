@@ -617,6 +617,137 @@ struct moeGemmTmaWarpSpecialized
     }
 };
 
+
+template <typename T, typename WeightType, typename GemmOutputType, typename ScaleType, typename arch,
+    typename QuantModeType,
+    typename std::enable_if_t<!std::is_same_v<T, __nv_fp8_e4m3>
+        && !std::is_same_v<WeightType, __nv_fp8_e4m3>>* = nullptr>
+struct moeGemmTmaWarpSpecializedSM100
+{
+    static_assert(100 <= arch::kMinComputeCapability, "moeGemmTmaWarpSpecializedSM100 requires SM100+.");
+    using ProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>; // <M,N,K>
+                                                                                       // per group
+
+    using ElementA = typename NvToCutlassTypeAdapter<T>::type; // Element type for
+                                                               // A matrix operand
+    using LayoutA = cutlass::layout::RowMajor;                 // Layout type for A matrix operand
+    constexpr static int AlignmentA
+        = 128 / cutlass::sizeof_bits<ElementA>::value; // Memory access granularity/alignment of A
+                                                       // matrix in units of elements (up to 16 bytes)
+
+    // B matrix configuration
+    using ElementB = typename NvToCutlassTypeAdapter<WeightType>::type; // Element type for
+                                                                        // B matrix operand
+    using LayoutB = cutlass::layout::ColumnMajor;                       // Layout type for B matrix operand
+    constexpr static int AlignmentB
+        = 128 / cutlass::sizeof_bits<ElementB>::value; // Memory access granularity/alignment of B
+                                                       // matrix in units of elements (up to 16 bytes)
+
+    // C matrix configuration
+    using ElementC = typename NvToCutlassTypeAdapter<GemmOutputType>::type; // Element type for C and D matrix operands
+    using LayoutC = cutlass::layout::RowMajor;                              // Layout type for C and D matrix operands
+    constexpr static int AlignmentC
+        = 128 / cutlass::sizeof_bits<ElementC>::value; // Memory access granularity/alignment of C
+                                                       // matrix in units of elements (up to 16 bytes)
+
+    // D matrix configuration
+    using ElementD = ElementC;
+    using LayoutD = LayoutC;
+    constexpr static int AlignmentD = AlignmentC;
+
+    // Core kernel configurations
+    using ElementAccumulator = float;    // Element type for internal accumulation
+    using ArchTag = cutlass::arch::Sm100; // Tag indicating the minimum SM that supports the intended feature
+    using OperatorClass = cutlass::arch::OpClassTensorOp;             // Operator class tag
+    using StageCountType = cutlass::gemm::collective::StageCountAuto; // Stage count maximized based on the tile size
+
+    using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100;
+    using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;
+    using TileShape = cute::Shape<cute::_256, cute::_256, Int<128 / sizeof(ElementA)>;
+    using ClusterShape = cute::Shape<cute::_2, cute::_1, cute::_1>;
+
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag,
+        cutlass::arch::OpClassTensorOp, TileShape, ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator, ElementAccumulator, ElementC, LayoutC*, AlignmentC, ElementC, LayoutC*, AlignmentC,
+        EpilogueSchedule, cutlass::epilogue::fusion::LinearCombination<ElementC, ElementAccumulator>>::CollectiveOp;
+
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<ArchTag, OperatorClass, ElementA,
+        LayoutA*, AlignmentA, ElementB, LayoutB*, AlignmentB, ElementAccumulator, TileShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+            sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        KernelSchedule>::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, CollectiveMainloop, CollectiveEpilogue>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+    using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+    using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+    using StrideD = typename Gemm::GemmKernel::InternalStrideD;
+
+    static void call(GroupedGemmInput<T, WeightType, GemmOutputType, ScaleType, QuantModeType> inputs)
+    {
+        static cutlass::KernelHardwareInfo kernel_hw_info
+            = cutlass::KernelHardwareInfo::make_kernel_hardware_info<typename Gemm::GemmKernel>(0 /*device_id*/);
+
+        auto block_A = (ElementA const*) inputs.A;
+        auto block_B = (ElementB const*) inputs.B;
+        auto block_C = (ElementC const*) inputs.C;
+        auto block_D = (ElementD*) inputs.D;
+        auto ptr_A = (ElementA const**) (inputs.workspace_ptr);
+        auto ptr_B = (ElementB const**) (ptr_A + inputs.num_experts);
+        auto ptr_C = (ElementC const**) (ptr_B + inputs.num_experts);
+        auto ptr_D = (ElementD**) (ptr_C + inputs.num_experts);
+        auto stride_A = (StrideA*) (align_pointer(ptr_D + inputs.num_experts));
+        auto stride_B = (StrideB*) (stride_A + inputs.num_experts);
+        auto stride_C = (StrideC*) (stride_B + inputs.num_experts);
+        auto stride_D = (StrideD*) (stride_C + inputs.num_experts);
+
+        auto* problem_sizes
+            = (typename ProblemShape::UnderlyingProblemShape*) (align_pointer(stride_D + inputs.num_experts));
+
+        auto gemm_workspace = (uint8_t*) (align_pointer(problem_sizes + inputs.num_experts));
+
+        constexpr int BLOCK_SIZE = 128;
+        auto GRID_SIZE = (inputs.num_experts + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        configureTmaWarpSpecializeGemmKernel<<<dim3(GRID_SIZE), dim3(BLOCK_SIZE), 0, inputs.stream>>>(
+            inputs.num_experts, inputs.cumsum_counter, block_A, block_B, block_D, inputs.K, inputs.N, ptr_A, ptr_B,
+            ptr_D, stride_A, stride_B, stride_C, stride_D, problem_sizes);
+
+        typename Gemm::Arguments arguments{cutlass::gemm::GemmUniversalMode::kGrouped,
+            {inputs.num_experts, problem_sizes, (typename ProblemShape::UnderlyingProblemShape*) nullptr},
+            {ptr_A, stride_A, ptr_B, stride_B},
+            {{}, // epilogue.thread
+                ptr_C, stride_C, ptr_D, stride_D},
+            kernel_hw_info};
+
+        auto& fusion_args = arguments.epilogue.thread;
+
+        fusion_args.alpha = 1.0;
+        fusion_args.beta = 0.0;
+        fusion_args.alpha_ptr = nullptr;
+        fusion_args.beta_ptr = nullptr;
+        fusion_args.alpha_ptr_array = nullptr;
+        fusion_args.beta_ptr_array = nullptr;
+        // Single alpha and beta for all groups
+        fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
+        fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
+
+        Gemm gemm;
+
+        // Allocate workspace memory
+        // 经验表明，需要 84480 byte workspace
+
+        // Check if the problem size is supported or not
+        CUTLASS_CHECK(gemm.can_implement(arguments));
+
+        // Initialize CUTLASS kernel with arguments and workspace pointer
+        CUTLASS_CHECK(gemm.initialize(arguments, gemm_workspace, inputs.stream));
+        CUTLASS_CHECK(gemm.run(inputs.stream));
+    }
+};
+
+
 template <typename ElementA, typename ElementB, typename ElementD, typename LeadingDimElement, typename ProblemShape>
 __global__ void configureGemmKernel(int num_experts, int const* cumsum_counter, ElementA* A, ElementB* B, ElementD* D,
     int N, int K, ElementA** ptr_A, ElementB** ptr_B, ElementD** ptr_D, LeadingDimElement* lda, LeadingDimElement* ldb,
@@ -1308,6 +1439,10 @@ void dispatchMoeGemmTmaWarpSpecialized(GroupedGemmInput<T, WeightType, GemmOutpu
         {
             moeGemmTmaWarpSpecialized<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType>::call(inputs);
         }
+        // else if constexpr (arch::kMinComputeCapability == 100 && !std::is_same_v<T, float>)
+        // {
+        //     moeGemmTmaWarpSpecializedSM100<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType>::call(inputs);
+        // }
         else
         {
             dispatchMoeGemm<T, WeightType, GemmOutputType, ScaleType, arch, QuantModeType>(inputs);
@@ -1363,7 +1498,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleType>::dispatchToArch(
     {
         dispatchMoeGemmTmaWarpSpecialized<T, WeightType, OutputType, ScaleType, cutlass::arch::Sm90, QuantModeType>(
             inputs);
-    } else if (sm_ == 100)
+    } else if (sm_ == 100 || sm_ == 120)
     {
         dispatchMoeGemmTmaWarpSpecialized<T, WeightType, OutputType, ScaleType, cutlass::arch::Sm100, QuantModeType>(inputs);
     }
