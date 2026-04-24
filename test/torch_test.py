@@ -196,7 +196,7 @@ def test(compute_capability: int):
             "GemmGrouped",
             fused=True
         )
-    if compute_capability == 90:
+    if compute_capability >= 90:
         test_dynamic_quantization_moe(
             "block",
             1024,
