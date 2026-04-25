@@ -663,7 +663,7 @@ struct moeGemmTmaWarpSpecializedSM100
 
     using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmSm100;
     using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;
-    using TileShape = cute::Shape<cute::_256, cute::_256, Int<128 / sizeof(ElementA)>;
+    using TileShape = cute::Shape<cute::_256, cute::_256, Int<128 / sizeof(ElementA)>>;
     using ClusterShape = cute::Shape<cute::_2, cute::_1, cute::_1>;
 
     using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<ArchTag,
@@ -1478,13 +1478,13 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleType>::dispatchToArch(
         "Possible fix: Ensure the `QuantModeType` template argument aligns "
         "with the `use_fp8` setting in class "
         "instantiation.");
-    if (sm_ >= 80 && sm_ < 90)
+    if (sm_ >= 80 && sm_ < 90 || sm_ == 120)
     {
         if constexpr (use_fp8)
         {
-            CPU_CHECK_FORMAT(sm_ == 89,
+            CPU_CHECK_FORMAT(sm_ == 89 || sm_ == 120,
                 "For sm >= 80 and < 90, fp8 is only supported "
-                "with sm == 89, current sm is %d",
+                "with sm == 89 or sm == 120, current sm is %d",
                 sm_);
             dispatchMoeGemm<T, WeightType, OutputType, ScaleType, cutlass::arch::Sm89, QuantModeType>(inputs);
         }
@@ -1498,7 +1498,7 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleType>::dispatchToArch(
     {
         dispatchMoeGemmTmaWarpSpecialized<T, WeightType, OutputType, ScaleType, cutlass::arch::Sm90, QuantModeType>(
             inputs);
-    } else if (sm_ == 100 || sm_ == 120)
+    } else if (sm_ == 100)
     {
         dispatchMoeGemmTmaWarpSpecialized<T, WeightType, OutputType, ScaleType, cutlass::arch::Sm100, QuantModeType>(inputs);
     }
