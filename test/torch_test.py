@@ -172,14 +172,14 @@ def compare_grouped_gemm_fused_and_unfused():
 
 
 def test(compute_capability: int):
-    test_dynamic_quantization_moe(
-        "bfloat16",
-        0,
-        util.generate_non_quant,
-        moe_test.m_grouped_moe_nt_contiguous_bf16,
-        "GemmUniversal",
-    )
-    if compute_capability == 89:
+    if compute_capability == 89 or compute_capability == 120:
+        test_dynamic_quantization_moe(
+            "bfloat16",
+            0,
+            util.generate_non_quant,
+            moe_test.m_grouped_moe_nt_contiguous_bf16,
+            "GemmGrouped",
+        )
         test_dynamic_quantization_moe(
             "channel",
             512,
@@ -196,7 +196,14 @@ def test(compute_capability: int):
             "GemmGrouped",
             fused=True
         )
-    if compute_capability >= 90:
+    if compute_capability == 90 or compute_capability == 100:
+        test_dynamic_quantization_moe(
+            "bfloat16",
+            0,
+            util.generate_non_quant,
+            moe_test.m_grouped_moe_nt_contiguous_bf16,
+            "GemmUniversal",
+        )
         test_dynamic_quantization_moe(
             "block",
             1024,
